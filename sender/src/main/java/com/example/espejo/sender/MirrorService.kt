@@ -179,13 +179,16 @@ class MirrorService : Service() {
 
     private fun startEncoder() {
         val p = phoneSize()
-        val scale = minOf(tvW.toFloat() / p.x, tvH.toFloat() / p.y, 1f)
+        // Limita por el lado largo (no deja el video vertical diminuto)
+        val tvLong = maxOf(tvW, tvH).toFloat()
+        val phoneLong = maxOf(p.x, p.y).toFloat()
+        val scale = minOf(tvLong / phoneLong, 1f)
         val w = ((p.x * scale).toInt() / 16) * 16
         val h = ((p.y * scale).toInt() / 16) * 16
 
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, w * h * 4)
+            setInteger(MediaFormat.KEY_BIT_RATE, w * h * 5)
             setInteger(MediaFormat.KEY_FRAME_RATE, 60)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000)

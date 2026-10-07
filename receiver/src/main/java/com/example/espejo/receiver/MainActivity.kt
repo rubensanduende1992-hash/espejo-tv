@@ -279,7 +279,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             val sw = root.width.toFloat()
             val sh = root.height.toFloat()
             if (sw == 0f || sh == 0f) return@runOnUiThread
-            val scale = if (FILL) maxOf(sw / w, sh / h) else minOf(sw / w, sh / h)
+            // Horizontal: llena la pantalla. Vertical: se ajusta (barras negras a los lados)
+            val fill = FILL && w >= h
+            val scale = if (fill) maxOf(sw / w, sh / h) else minOf(sw / w, sh / h)
             val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
             lp.width = (w * scale).toInt()
             lp.height = (h * scale).toInt()
