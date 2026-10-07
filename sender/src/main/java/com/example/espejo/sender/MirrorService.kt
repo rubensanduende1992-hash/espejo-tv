@@ -19,7 +19,9 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.Display
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -34,6 +36,22 @@ class MirrorService : Service() {
     private var out: DataOutputStream? = null
     private var audioRecord: AudioRecord? = null
     private val lock = Any() // protege las escrituras al socket (video + audio)
+    private var lastLandscape: Boolean? = null
+
+    // Detecta el giro del celular (aunque la app este en segundo plano)
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY || !running) return
+            val p = phoneSize()
+            val landscape = p.x > p.y
+            if (landscape != lastLandscape) {
+                lastLandscape = landscape
+                restart = true
+            }
+        }
+    }
 
     @Volatile private var running = false
     @Volatile private var restart = false
@@ -81,6 +99,9 @@ class MirrorService : Service() {
                 override fun onStop() { running = false }
             }, null)
 
+            getSystemService(DisplayManager::class.java)
+                .registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+
             startEncoder()
             startAudio()
 
@@ -88,7 +109,6 @@ class MirrorService : Service() {
             while (running) {
                 if (restart) {
                     restart = false
-                    releaseEncoder()
                     startEncoder()
                 }
                 val enc = encoder ?: break
@@ -179,6 +199,7 @@ class MirrorService : Service() {
 
     private fun startEncoder() {
         val p = phoneSize()
+        lastLandscape = p.x > p.y
         // Limita por el lado largo (no deja el video vertical diminuto)
         val tvLong = maxOf(tvW, tvH).toFloat()
         val phoneLong = maxOf(p.x, p.y).toFloat()
@@ -198,14 +219,28 @@ class MirrorService : Service() {
         enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val surface = enc.createInputSurface()
         enc.start()
+
+        val oldEncoder = encoder
         encoder = enc
 
-        display = projection!!.createVirtualDisplay(
-            "espejo", w, h, resources.displayMetrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            surface, null, null
-        )
+        val dpi = resources.displayMetrics.densityDpi
+        val vd = display
+        if (vd == null) {
+            display = projection!!.createVirtualDisplay(
+                "espejo", w, h, dpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                surface, null, null
+            )
+        } else {
+            // Android 14+ no permite crear otro VirtualDisplay con la misma
+            // proyeccion: se reutiliza el existente y se le cambia tamano y superficie
+            vd.resize(w, h, dpi)
+            vd.setSurface(surface)
+        }
 
+        try { oldEncoder?.stop(); oldEncoder?.release() } catch (_: Exception) {}
+
+        // Cabecera: la TV reconfigura su decodificador y su vista
         synchronized(lock) {
             out!!.writeByte(0)
             out!!.writeInt(w)
@@ -221,14 +256,10 @@ class MirrorService : Service() {
         encoder = null
     }
 
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        if (running) restart = true
-    }
-
     private fun cleanup() {
         running = false
         releaseEncoder()
+        try { getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener) } catch (_: Exception) {}
         try { audioRecord?.stop(); audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
         try { projection?.stop() } catch (_: Exception) {}
