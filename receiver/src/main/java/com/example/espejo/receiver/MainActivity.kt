@@ -8,6 +8,7 @@ import android.media.MediaCodec
 import android.media.MediaFormat
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.SurfaceHolder
@@ -159,7 +160,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         val minBuf = AudioTrack.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT
         )
-        val track = AudioTrack.Builder()
+        val builder = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -175,8 +176,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             )
             .setBufferSizeInBytes(minBuf * 4)
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-            .build()
+        if (Build.VERSION.SDK_INT >= 26) {
+            builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+        }
+        val track = builder.build()
         track.play()
         audioTrack = track
     }
@@ -237,7 +240,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private fun startDecoder(w: Int, h: Int, holder: SurfaceHolder) {
         try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h)
-        format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        if (Build.VERSION.SDK_INT >= 30) {
+            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        }
         val dec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         dec.configure(format, holder.surface, null, 0)
         dec.start()
