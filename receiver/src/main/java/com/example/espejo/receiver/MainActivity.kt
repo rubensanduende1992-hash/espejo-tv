@@ -6,15 +6,21 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.os.Bundle
 import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import kotlin.concurrent.thread
 
@@ -28,10 +34,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     private lateinit var root: FrameLayout
     private lateinit var surfaceView: SurfaceView
+    private lateinit var infoText: TextView
     private var decoder: MediaCodec? = null
     private var audioTrack: AudioTrack? = null
     @Volatile private var running = false
     private var server: ServerSocket? = null
+
+    private var nsd: NsdManager? = null
+    private var regListener: NsdManager.RegistrationListener? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,6 +55,20 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 Gravity.CENTER
+            )
+        )
+        infoText = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 28f
+            setPadding(48, 48, 48, 48)
+            text = "Esperando al celular..."
+        }
+        root.addView(
+            infoText,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.START
             )
         )
         setContentView(root)
@@ -61,13 +85,67 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         running = false
+        unregisterNsd()
         try { server?.close() } catch (_: Exception) {}
     }
+
+    // ---------- Descubrimiento automatico (NSD) ----------
+
+    private fun registerNsd() {
+        if (regListener != null) return
+        val info = NsdServiceInfo().apply {
+            serviceName = "EspejoTV"
+            serviceType = "_espejotv._tcp."
+            port = 5000
+        }
+        val l = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(i: NsdServiceInfo) {}
+            override fun onRegistrationFailed(i: NsdServiceInfo, e: Int) {}
+            override fun onServiceUnregistered(i: NsdServiceInfo) {}
+            override fun onUnregistrationFailed(i: NsdServiceInfo, e: Int) {}
+        }
+        regListener = l
+        nsd = getSystemService(NsdManager::class.java)
+        try {
+            nsd?.registerService(info, NsdManager.PROTOCOL_DNS_SD, l)
+        } catch (_: Exception) {
+            regListener = null
+        }
+    }
+
+    private fun unregisterNsd() {
+        try { regListener?.let { nsd?.unregisterService(it) } } catch (_: Exception) {}
+        regListener = null
+    }
+
+    private fun localIp(): String? = try {
+        NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }
+            .firstOrNull { !it.isLoopbackAddress && it is Inet4Address && it.isSiteLocalAddress }
+            ?.hostAddress
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun showWaiting() {
+        val ip = localIp()
+        runOnUiThread {
+            infoText.text = if (ip != null)
+                "Esperando al celular...\nIP de esta TV: $ip"
+            else
+                "Esperando al celular..."
+            infoText.visibility = View.VISIBLE
+        }
+    }
+
+    // ---------- Servidor ----------
 
     private fun serverLoop(holder: SurfaceHolder) {
         try {
             server = ServerSocket(5000)
+            registerNsd()
             while (running) {
+                showWaiting()
                 val socket = server!!.accept()
                 socket.tcpNoDelay = true
                 handleClient(socket, holder)
@@ -128,6 +206,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                         val h = input.readInt()
                         startDecoder(w, h, holder)
                         adjustView(w, h)
+                        runOnUiThread { infoText.visibility = View.GONE }
                     }
                     1 -> {
                         val flags = input.readInt()

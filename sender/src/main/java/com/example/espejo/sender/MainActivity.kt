@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.os.Bundle
 import android.text.InputType
 import android.widget.Button
@@ -14,10 +16,14 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import java.net.Inet4Address
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var ipField: EditText
+    private lateinit var status: TextView
+    private var nsd: NsdManager? = null
+    private var discoveryListener: NsdManager.DiscoveryListener? = null
 
     private val capture = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -45,7 +51,14 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 96, 48, 48)
         }
-        layout.addView(TextView(this).apply { text = "IP de la TV (la muestra la app receptora)" })
+
+        status = TextView(this).apply { text = "Buscando la TV en el WiFi..." }
+        layout.addView(status)
+
+        layout.addView(TextView(this).apply {
+            text = "IP de la TV (se completa sola; si no, escribila):"
+            setPadding(0, 32, 0, 0)
+        })
 
         ipField = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_PHONE
@@ -57,6 +70,14 @@ class MainActivity : AppCompatActivity() {
         layout.addView(Button(this).apply {
             text = "Iniciar espejo"
             setOnClickListener {
+                if (ipField.text.toString().trim().isEmpty()) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "No se encontro la TV. Abri la app de la TV o escribi su IP.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@setOnClickListener
+                }
                 if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                     != PackageManager.PERMISSION_GRANTED
                 ) {
@@ -77,5 +98,51 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { stopService(Intent(this@MainActivity, MirrorService::class.java)) }
         })
         setContentView(layout)
+
+        startDiscovery()
+    }
+
+    // Busca la TV en la red local (la app de la TV se anuncia sola)
+    @Suppress("DEPRECATION")
+    private fun startDiscovery() {
+        val mgr = getSystemService(NsdManager::class.java)
+        nsd = mgr
+        val listener = object : NsdManager.DiscoveryListener {
+            override fun onDiscoveryStarted(serviceType: String) {}
+            override fun onDiscoveryStopped(serviceType: String) {}
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                runOnUiThread { status.text = "No se pudo buscar la TV. Escribi la IP a mano." }
+            }
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
+            override fun onServiceLost(service: NsdServiceInfo) {}
+
+            override fun onServiceFound(service: NsdServiceInfo) {
+                if (!service.serviceType.contains("_espejotv")) return
+                mgr.resolveService(service, object : NsdManager.ResolveListener {
+                    override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {}
+                    override fun onServiceResolved(info: NsdServiceInfo) {
+                        val host = info.host
+                        if (host is Inet4Address) {
+                            val ip = host.hostAddress ?: return
+                            runOnUiThread {
+                                ipField.setText(ip)
+                                status.text = "TV encontrada: $ip"
+                            }
+                        }
+                    }
+                })
+            }
+        }
+        discoveryListener = listener
+        try {
+            mgr.discoverServices("_espejotv._tcp.", NsdManager.PROTOCOL_DNS_SD, listener)
+        } catch (_: Exception) {
+            status.text = "No se pudo buscar la TV. Escribi la IP a mano."
+        }
+    }
+
+    override fun onDestroy() {
+        try { discoveryListener?.let { nsd?.stopServiceDiscovery(it) } } catch (_: Exception) {}
+        super.onDestroy()
     }
 }
