@@ -1,0 +1,45 @@
+name: Compilar APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+
+      - name: Preparar archivos
+        run: |
+          mkdir -p dist
+          cp sender/build/outputs/apk/debug/sender-debug.apk dist/sender.apk
+          cp receiver/build/outputs/apk/debug/receiver-debug.apk dist/receiver.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: dist/*.apk
+
+      - name: Publicar en Releases (enlace directo para Downloader)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Ultima version
+          files: dist/*.apk
