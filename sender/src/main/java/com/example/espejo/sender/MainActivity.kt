@@ -12,6 +12,8 @@ import android.text.InputType
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,6 +23,7 @@ import java.net.Inet4Address
 class MainActivity : AppCompatActivity() {
 
     private lateinit var ipField: EditText
+    private var quality = 0 // 0 = rapida, 1 = equilibrada, 2 = alta
     private lateinit var status: TextView
     private var nsd: NsdManager? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
@@ -35,6 +38,7 @@ class MainActivity : AppCompatActivity() {
                 putExtra("code", result.resultCode)
                 putExtra("data", result.data)
                 putExtra("host", ip)
+                putExtra("quality", quality)
             }
             startForegroundService(i)
         }
@@ -66,6 +70,27 @@ class MainActivity : AppCompatActivity() {
             setText(getSharedPreferences("cfg", Context.MODE_PRIVATE).getString("ip", ""))
         }
         layout.addView(ipField)
+
+        val prefs = getSharedPreferences("cfg", Context.MODE_PRIVATE)
+        quality = prefs.getInt("quality", 0)
+        layout.addView(TextView(this).apply {
+            text = "Calidad (si hay retraso, usa Rapida):"
+            setPadding(0, 32, 0, 0)
+        })
+        val group = RadioGroup(this)
+        val labels = arrayOf("Rapida (menos retraso)", "Equilibrada", "Alta (mas nitida)")
+        labels.forEachIndexed { i, label ->
+            group.addView(RadioButton(this).apply {
+                id = 1000 + i
+                text = label
+                isChecked = (i == quality)
+            })
+        }
+        group.setOnCheckedChangeListener { _, checkedId ->
+            quality = checkedId - 1000
+            prefs.edit().putInt("quality", quality).apply()
+        }
+        layout.addView(group)
 
         layout.addView(Button(this).apply {
             text = "Iniciar espejo"

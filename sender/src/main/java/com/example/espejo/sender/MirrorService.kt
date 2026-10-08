@@ -19,6 +19,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -28,6 +29,10 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.nio.ByteBuffer
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class MirrorService : Service() {
 
@@ -39,6 +44,11 @@ class MirrorService : Service() {
     private var audioRecord: AudioRecord? = null
     private val lock = Any() // protege las escrituras al socket (video + audio)
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val sendQueue = LinkedBlockingQueue<ByteArray>()
+    private val queuedBytes = AtomicInteger(0)
+    private val MAX_QUEUE = 256 * 1024 // tope de datos en espera (unos 0,4 s de video)
+    @Volatile private var waitingKeyframe = false
+    private var quality = 0 // 0 = rapida, 1 = equilibrada, 2 = alta
     @Volatile private var lastLandscape: Boolean? = null
 
     // Detecta el giro del celular (aunque la app este en segundo plano)
@@ -88,6 +98,7 @@ class MirrorService : Service() {
         val code = intent.getIntExtra("code", 0)
         val data = intent.getParcelableExtra<Intent>("data") ?: return START_NOT_STICKY
         val host = intent.getStringExtra("host") ?: return START_NOT_STICKY
+        quality = intent.getIntExtra("quality", 0).coerceIn(0, 2)
 
         running = true
         Thread { stream(code, data, host) }.start()
@@ -107,6 +118,7 @@ class MirrorService : Service() {
             tvW = input.readInt()
             tvH = input.readInt()
             Status.post("Conectado a la TV ($tvW x $tvH). Transmitiendo...")
+            startWriter()
 
             val mpm = getSystemService(MediaProjectionManager::class.java)
             projection = mpm.getMediaProjection(code, data)
@@ -160,14 +172,20 @@ class MirrorService : Service() {
                     val bytes = ByteArray(info.size)
                     buf.position(info.offset)
                     buf.get(bytes)
-                    synchronized(lock) {
-                        out!!.writeByte(1)
-                        out!!.writeInt(info.flags)
-                        out!!.writeLong(info.presentationTimeUs)
-                        out!!.writeInt(bytes.size)
-                        out!!.write(bytes)
-                        out!!.flush()
+                    val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                    val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                    var send = true
+                    if (!isConfig) {
+                        if (waitingKeyframe) {
+                            // Descartando atraso: se retoma en el proximo cuadro clave
+                            if (isKey) waitingKeyframe = false else send = false
+                        } else if (!isKey && queuedBytes.get() > MAX_QUEUE) {
+                            waitingKeyframe = true
+                            send = false
+                            requestKeyframe(enc)
+                        }
                     }
+                    if (send) enqueue(packetVideo(info.flags, info.presentationTimeUs, bytes))
                     enc.releaseOutputBuffer(idx, false)
                 }
             }
@@ -178,6 +196,58 @@ class MirrorService : Service() {
             cleanup()
             stopSelf()
         }
+    }
+
+    // ---------- COLA DE ENVIO ----------
+
+    private fun enqueue(pkt: ByteArray) {
+        queuedBytes.addAndGet(pkt.size)
+        sendQueue.add(pkt)
+    }
+
+    private fun packetHeader(w: Int, h: Int): ByteArray {
+        val bb = ByteBuffer.allocate(1 + 4 + 4)
+        bb.put(0); bb.putInt(w); bb.putInt(h)
+        return bb.array()
+    }
+
+    private fun packetVideo(flags: Int, pts: Long, data: ByteArray): ByteArray {
+        val bb = ByteBuffer.allocate(1 + 4 + 8 + 4 + data.size)
+        bb.put(1); bb.putInt(flags); bb.putLong(pts); bb.putInt(data.size); bb.put(data)
+        return bb.array()
+    }
+
+    private fun packetAudio(data: ByteArray, n: Int): ByteArray {
+        val bb = ByteBuffer.allocate(1 + 4 + n)
+        bb.put(2); bb.putInt(n); bb.put(data, 0, n)
+        return bb.array()
+    }
+
+    private fun requestKeyframe(enc: MediaCodec) {
+        try {
+            enc.setParameters(Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            })
+        } catch (_: Exception) {
+        }
+    }
+
+    // Un solo hilo escribe en la red; si la red va lenta, el video se descarta
+    // en lugar de acumular segundos de retraso
+    private fun startWriter() {
+        Thread {
+            try {
+                while (running) {
+                    val pkt = sendQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                    queuedBytes.addAndGet(-pkt.size)
+                    out!!.write(pkt)
+                    out!!.flush()
+                }
+            } catch (e: Exception) {
+                Status.post("Error de red: ${e.javaClass.simpleName} ${e.message ?: ""}".trim())
+                running = false
+            }
+        }.start()
     }
 
     // ---------- AUDIO ----------
@@ -214,11 +284,8 @@ class MirrorService : Service() {
                     while (running) {
                         val n = rec.read(chunk, 0, chunk.size)
                         if (n > 0) {
-                            synchronized(lock) {
-                                out!!.writeByte(2)
-                                out!!.writeInt(n)
-                                out!!.write(chunk, 0, n)
-                                out!!.flush()
+                            if (queuedBytes.get() < MAX_QUEUE * 2) {
+                                enqueue(packetAudio(chunk, n))
                             }
                         }
                     }
@@ -246,7 +313,7 @@ class MirrorService : Service() {
         val p = phoneSize()
         lastLandscape = p.x > p.y
         // Limita por el lado largo (no deja el video vertical diminuto)
-        val tvLong = maxOf(tvW, tvH).toFloat()
+        val tvLong = minOf(maxOf(tvW, tvH), intArrayOf(1280, 1600, 1920)[quality]).toFloat()
         val phoneLong = maxOf(p.x, p.y).toFloat()
         val scale = minOf(tvLong / phoneLong, 1f)
         val w = ((p.x * scale).toInt() / 16) * 16
@@ -261,7 +328,7 @@ class MirrorService : Service() {
         // 2) Codificador nuevo, pensado para poco retraso
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, w * h * 3)
+            setInteger(MediaFormat.KEY_BIT_RATE, w * h * intArrayOf(3, 4, 5)[quality])
             setInteger(MediaFormat.KEY_FRAME_RATE, 60)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000)
@@ -291,12 +358,10 @@ class MirrorService : Service() {
         }
 
         // 4) Cabecera: la TV reconfigura su decodificador y su vista
-        synchronized(lock) {
-            out!!.writeByte(0)
-            out!!.writeInt(w)
-            out!!.writeInt(h)
-            out!!.flush()
-        }
+        sendQueue.clear()
+        queuedBytes.set(0)
+        waitingKeyframe = false
+        enqueue(packetHeader(w, h))
         Status.post("Transmitiendo ${w}x${h}")
     }
 
@@ -309,6 +374,7 @@ class MirrorService : Service() {
 
     private fun cleanup() {
         running = false
+        sendQueue.clear()
         releaseEncoder()
         try { getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener) } catch (_: Exception) {}
         try { audioRecord?.stop(); audioRecord?.release() } catch (_: Exception) {}
