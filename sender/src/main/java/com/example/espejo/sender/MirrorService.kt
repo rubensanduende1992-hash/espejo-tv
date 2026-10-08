@@ -37,6 +37,7 @@ class MirrorService : Service() {
     private var out: DataOutputStream? = null
     private var audioRecord: AudioRecord? = null
     private val lock = Any() // protege las escrituras al socket (video + audio)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var lastLandscape: Boolean? = null
 
     // Detecta el giro del celular (aunque la app este en segundo plano)
@@ -109,10 +110,10 @@ class MirrorService : Service() {
             projection = mpm.getMediaProjection(code, data)
             projection!!.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() { running = false }
-            }, null)
+            }, mainHandler)
 
             getSystemService(DisplayManager::class.java)
-                .registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+                .registerDisplayListener(displayListener, mainHandler)
 
             startEncoder()
             startAudio()
@@ -244,7 +245,7 @@ class MirrorService : Service() {
             display = projection!!.createVirtualDisplay(
                 "espejo", w, h, dpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                surface, null, null
+                surface, null, mainHandler
             )
         } else {
             // Android 14+ no permite crear otro VirtualDisplay con la misma
