@@ -22,6 +22,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Display
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -38,7 +39,7 @@ class MirrorService : Service() {
     private var audioRecord: AudioRecord? = null
     private val lock = Any() // protege las escrituras al socket (video + audio)
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var lastLandscape: Boolean? = null
+    @Volatile private var lastLandscape: Boolean? = null
 
     // Detecta el giro del celular (aunque la app este en segundo plano)
     private val displayListener = object : DisplayManager.DisplayListener {
@@ -97,10 +98,11 @@ class MirrorService : Service() {
         try {
             Status.post("Conectando a $host ...")
             val s = Socket()
+            s.sendBufferSize = 128 * 1024 // buffer chico = menos retraso acumulado
             s.connect(InetSocketAddress(host, 5000), 5000)
             s.tcpNoDelay = true
             socket = s
-            out = DataOutputStream(socket!!.getOutputStream().buffered(256 * 1024))
+            out = DataOutputStream(socket!!.getOutputStream().buffered(64 * 1024))
             val input = DataInputStream(socket!!.getInputStream())
             tvW = input.readInt()
             tvH = input.readInt()
@@ -119,10 +121,37 @@ class MirrorService : Service() {
             startAudio()
 
             val info = MediaCodec.BufferInfo()
+            var lastCheck = 0L
             while (running) {
+                // Comprobacion periodica del giro (por si el aviso del sistema no llega)
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastCheck > 400) {
+                    lastCheck = now
+                    val pp = phoneSize()
+                    if ((pp.x > pp.y) != lastLandscape) restart = true
+                }
                 if (restart) {
                     restart = false
-                    startEncoder()
+                    Status.post("Girando la pantalla...")
+                    var ok = false
+                    var lastError: Exception? = null
+                    for (attempt in 1..3) {
+                        try {
+                            Thread.sleep(if (attempt == 1) 250L else 600L)
+                            startEncoder()
+                            ok = true
+                            break
+                        } catch (e: Exception) {
+                            lastError = e
+                            e.printStackTrace()
+                        }
+                    }
+                    if (!ok) {
+                        Status.post(
+                            "Error al girar: ${lastError?.javaClass?.simpleName} ${lastError?.message ?: ""}".trim()
+                        )
+                        break
+                    }
                 }
                 val enc = encoder ?: break
                 val idx = enc.dequeueOutputBuffer(info, 100_000)
@@ -223,24 +252,31 @@ class MirrorService : Service() {
         val w = ((p.x * scale).toInt() / 16) * 16
         val h = ((p.y * scale).toInt() / 16) * 16
 
+        // 1) Soltar lo anterior primero (los codificadores de hardware son pocos)
+        val vd = display
+        try { vd?.setSurface(null) } catch (_: Exception) {}
+        try { encoder?.stop(); encoder?.release() } catch (_: Exception) {}
+        encoder = null
+
+        // 2) Codificador nuevo, pensado para poco retraso
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, w * h * 5)
+            setInteger(MediaFormat.KEY_BIT_RATE, w * h * 3)
             setInteger(MediaFormat.KEY_FRAME_RATE, 60)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000)
             setInteger(MediaFormat.KEY_LATENCY, 1)
+            setInteger(MediaFormat.KEY_PRIORITY, 0)      // tiempo real
+            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)  // sin reordenar cuadros
         }
         val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val surface = enc.createInputSurface()
         enc.start()
-
-        val oldEncoder = encoder
         encoder = enc
 
+        // 3) Enlazar con la captura
         val dpi = resources.displayMetrics.densityDpi
-        val vd = display
         if (vd == null) {
             display = projection!!.createVirtualDisplay(
                 "espejo", w, h, dpi,
@@ -254,15 +290,14 @@ class MirrorService : Service() {
             vd.setSurface(surface)
         }
 
-        try { oldEncoder?.stop(); oldEncoder?.release() } catch (_: Exception) {}
-
-        // Cabecera: la TV reconfigura su decodificador y su vista
+        // 4) Cabecera: la TV reconfigura su decodificador y su vista
         synchronized(lock) {
             out!!.writeByte(0)
             out!!.writeInt(w)
             out!!.writeInt(h)
             out!!.flush()
         }
+        Status.post("Transmitiendo ${w}x${h}")
     }
 
     private fun releaseEncoder() {

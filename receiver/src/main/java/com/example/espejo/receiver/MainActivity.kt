@@ -11,6 +11,7 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -21,17 +22,19 @@ import androidx.appcompat.app.AppCompatActivity
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.Inet4Address
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
-    // true = llena toda la pantalla (puede recortar un poco)
+    // true = llena toda la pantalla en horizontal (puede recortar un poco)
     // false = mantiene proporcion (puede dejar barras negras)
     private val FILL = true
 
     private val SAMPLE_RATE = 44100
+    private val BYTES_PER_MS = SAMPLE_RATE * 4 / 1000 // estereo, 16 bits
 
     private lateinit var root: FrameLayout
     private lateinit var surfaceView: SurfaceView
@@ -39,14 +42,20 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var decoder: MediaCodec? = null
     private var audioTrack: AudioTrack? = null
     @Volatile private var running = false
+    @Volatile private var streaming = false
+    @Volatile private var dropBytes = 0
+    private var audioDelayMs = 200
     private var server: ServerSocket? = null
 
     private var nsd: NsdManager? = null
     private var regListener: NsdManager.RegistrationListener? = null
 
+    private val hideInfo = Runnable { if (streaming) infoText.visibility = View.GONE }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        audioDelayMs = getSharedPreferences("cfg", MODE_PRIVATE).getInt("audioDelay", 200)
 
         root = FrameLayout(this)
         surfaceView = SurfaceView(this)
@@ -88,6 +97,34 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         running = false
         unregisterNsd()
         try { server?.close() } catch (_: Exception) {}
+    }
+
+    // ---------- Ajuste del sonido con el control remoto ----------
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_RIGHT -> { adjustAudioDelay(50); return true }
+            KeyEvent.KEYCODE_DPAD_LEFT -> { adjustAudioDelay(-50); return true }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    // Derecha = el sonido llega mas tarde (si la imagen va atrasada)
+    private fun adjustAudioDelay(deltaMs: Int) {
+        val newDelay = (audioDelayMs + deltaMs).coerceIn(0, 800)
+        val real = newDelay - audioDelayMs
+        audioDelayMs = newDelay
+        getSharedPreferences("cfg", MODE_PRIVATE).edit().putInt("audioDelay", newDelay).apply()
+        val bytes = (Math.abs(real) * BYTES_PER_MS / 4) * 4
+        if (real > 0) {
+            try { audioTrack?.write(ByteArray(bytes), 0, bytes, AudioTrack.WRITE_NON_BLOCKING) } catch (_: Exception) {}
+        } else if (real < 0) {
+            dropBytes += bytes
+        }
+        infoText.text = "Retraso del sonido: $audioDelayMs ms\n(izquierda / derecha en el control para ajustar)"
+        infoText.visibility = View.VISIBLE
+        infoText.removeCallbacks(hideInfo)
+        if (streaming) infoText.postDelayed(hideInfo, 3000)
     }
 
     // ---------- Descubrimiento automatico (NSD) ----------
@@ -143,11 +180,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     private fun serverLoop(holder: SurfaceHolder) {
         try {
-            server = ServerSocket(5000)
+            val ss = ServerSocket()
+            ss.reuseAddress = true
+            ss.receiveBufferSize = 128 * 1024 // buffer chico = menos retraso acumulado
+            ss.bind(InetSocketAddress(5000))
+            server = ss
             registerNsd()
             while (running) {
                 showWaiting()
-                val socket = server!!.accept()
+                val socket = ss.accept()
                 socket.tcpNoDelay = true
                 handleClient(socket, holder)
             }
@@ -174,13 +215,16 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                     .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                     .build()
             )
-            .setBufferSizeInBytes(minBuf * 4)
+            .setBufferSizeInBytes(maxOf(minBuf * 4, SAMPLE_RATE * 4)) // hasta 1 segundo
             .setTransferMode(AudioTrack.MODE_STREAM)
         if (Build.VERSION.SDK_INT >= 26) {
             builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
         }
         val track = builder.build()
         track.play()
+        // Silencio inicial: retrasa el sonido para que coincida con la imagen
+        val silence = ByteArray(audioDelayMs * BYTES_PER_MS / 4 * 4)
+        if (silence.isNotEmpty()) track.write(silence, 0, silence.size)
         audioTrack = track
     }
 
@@ -200,6 +244,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             output.writeInt(dm.heightPixels)
             output.flush()
 
+            dropBytes = 0
             startAudioTrack()
 
             while (running) {
@@ -207,6 +252,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                     0 -> {
                         val w = input.readInt()
                         val h = input.readInt()
+                        streaming = true
                         startDecoder(w, h, holder)
                         adjustView(w, h)
                         runOnUiThread { infoText.visibility = View.GONE }
@@ -223,13 +269,22 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                         val size = input.readInt()
                         val data = ByteArray(size)
                         input.readFully(data)
-                        // No bloqueante: si el buffer esta lleno, descarta
-                        audioTrack?.write(data, 0, size, AudioTrack.WRITE_NON_BLOCKING)
+                        var off = 0
+                        if (dropBytes > 0) {
+                            val d = minOf(dropBytes, size)
+                            dropBytes -= d
+                            off = d
+                        }
+                        if (size - off > 0) {
+                            // No bloqueante: si el buffer esta lleno, descarta
+                            audioTrack?.write(data, off, size - off, AudioTrack.WRITE_NON_BLOCKING)
+                        }
                     }
                 }
             }
         } catch (_: Exception) {
         } finally {
+            streaming = false
             try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
             decoder = null
             releaseAudioTrack()
@@ -243,6 +298,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         if (Build.VERSION.SDK_INT >= 30) {
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
         }
+        format.setInteger(MediaFormat.KEY_PRIORITY, 0)        // tiempo real
+        format.setInteger(MediaFormat.KEY_OPERATING_RATE, 60) // pista de velocidad
         val dec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         dec.configure(format, holder.surface, null, 0)
         dec.start()
