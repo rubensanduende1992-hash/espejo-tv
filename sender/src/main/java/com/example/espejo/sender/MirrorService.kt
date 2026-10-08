@@ -25,6 +25,7 @@ import android.os.Looper
 import android.view.Display
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.net.InetSocketAddress
 import java.net.Socket
 
 class MirrorService : Service() {
@@ -74,7 +75,13 @@ class MirrorService : Service() {
             .setContentTitle("Transmitiendo pantalla a la TV")
             .setSmallIcon(android.R.drawable.ic_menu_share)
             .build()
-        startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        try {
+            startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } catch (e: Exception) {
+            Status.post("Error al iniciar el servicio: ${e.javaClass.simpleName} ${e.message ?: ""}")
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         val code = intent.getIntExtra("code", 0)
         val data = intent.getParcelableExtra<Intent>("data") ?: return START_NOT_STICKY
@@ -87,11 +94,16 @@ class MirrorService : Service() {
 
     private fun stream(code: Int, data: Intent, host: String) {
         try {
-            socket = Socket(host, 5000).also { it.tcpNoDelay = true }
+            Status.post("Conectando a $host ...")
+            val s = Socket()
+            s.connect(InetSocketAddress(host, 5000), 5000)
+            s.tcpNoDelay = true
+            socket = s
             out = DataOutputStream(socket!!.getOutputStream().buffered(256 * 1024))
             val input = DataInputStream(socket!!.getInputStream())
             tvW = input.readInt()
             tvH = input.readInt()
+            Status.post("Conectado a la TV ($tvW x $tvH). Transmitiendo...")
 
             val mpm = getSystemService(MediaProjectionManager::class.java)
             projection = mpm.getMediaProjection(code, data)
@@ -129,7 +141,9 @@ class MirrorService : Service() {
                     enc.releaseOutputBuffer(idx, false)
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Status.post("Error: ${e.javaClass.simpleName} ${e.message ?: ""}".trim())
         } finally {
             cleanup()
             stopSelf()
@@ -184,6 +198,7 @@ class MirrorService : Service() {
         } catch (e: Exception) {
             // Si falla el audio (permiso denegado, etc.) el video sigue funcionando
             e.printStackTrace()
+            Status.post("Transmitiendo sin audio: ${e.message ?: e.javaClass.simpleName}")
         }
     }
 

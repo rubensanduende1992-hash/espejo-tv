@@ -95,9 +95,15 @@ class MainActivity : AppCompatActivity() {
         })
         layout.addView(Button(this).apply {
             text = "Detener"
-            setOnClickListener { stopService(Intent(this@MainActivity, MirrorService::class.java)) }
+            setOnClickListener {
+                stopService(Intent(this@MainActivity, MirrorService::class.java))
+                status.text = "Detenido"
+            }
         })
         setContentView(layout)
+
+        // Muestra en pantalla lo que informa el servicio de transmision
+        Status.listener = { msg -> runOnUiThread { status.text = msg } }
 
         startDiscovery()
     }
@@ -142,6 +148,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        Status.listener = null
         try { discoveryListener?.let { nsd?.stopServiceDiscovery(it) } } catch (_: Exception) {}
         super.onDestroy()
     }
